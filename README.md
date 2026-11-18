@@ -6,7 +6,8 @@
 
 团队原先通过纸质交接单、SQL 截图和 Excel 交接。三处痛点：样本版本难统一、并发移交容易重复、超时后无法确认回执是否回滚。上游为样本接收记录，本站承接样本登记、移交申请、并发复核和证据导出，下游为理化检测室与复核员。
 
-- 样本台账：批次、可用份数、保管位置，可录入。
+- 样本台账：批次、可用份数、保管位置，可录入；编号按“去首尾空格、忽略大小写”判重。
+- 重号清理：归一化重号分组，每组保留首登记件原号、其余自动改号；冲突号冻结受理、新号预占防抢注、中断可续办、原号写法归并到保留样本。
 - 流转申请：关联样本、指定数量和接收实验室。
 - 并发执行：Redis 队列、独立 Python worker、可设锁等待上限。
 - 冲突证据：Backend PID、SQLSTATE、回执回滚、数量守恒与 JSON 导出。
@@ -40,18 +41,28 @@ docker compose exec -T backend python -m scripts.seed_demo
 
 单 worker 顺序运行任务，无生产重试/崩溃恢复调度；worker中断时 running 任务需要人工重建，不能用作生产样本库存扣减。
 
+## 重号清理口径与并发受理
+
+样本编号统一以 `lower(btrim(code))` 归一化（去首尾空格、忽略大小写），`samples.code_norm` 落库；全部重号收敛后建立 `ux_samples_code_norm` 唯一索引作为数据库级兜底。清理规则与实现：
+
+- 扫描同 `code_norm` 多份样本即重号组，组内 id 最小者保留原号，其余按“保留件原号-R01/-R02”顺延改号，新号在建批时即写入 `code_reservations(kind=newcode)` 预占，杜绝执行前抢注窗口；冲突号写 `kind=frozen` 暂停受理。
+- 清理期间无关编号照常登记和发起移交；冻结号登记返回 409，预占新号登记同样 409。所有同号写操作先取 `pg_advisory_xact_lock(hashtextextended(归一化号))`，由数据库锁裁决先到者，不靠应用层先查后写。
+- 每个清理项在独立事务中推进（`cleanup_items` 记录 pending/done/failed），进程中断后凭状态续办：done 项直接跳过、样本仍挂原号才执行改号，重试不重复改号；单项失败只标记该项，不影响同批其他项。
+- 组内最后一项完成的同一事务内：删除冻结、把组内出现过的每种原号写法登记到 `sample_code_aliases` 只指向保留样本——改号与恢复受理一起生效，此后原号各种写法的登记均被别名拦截。旧移交按 `sample_id` 关联，不随改号漂移。
+- 清理批次经全局咨询锁串行编排，存在 processing 批次时拒绝重复建批；审计日志记录建批、每项改号、各组恢复受理。端到端演练见 `tests/test_cleanup.py`（40 项断言，含 8 路并发争全新号、清理改号与 5 路登记争同一新号、并发续办）。
+
 ## 工程说明
 
 |服务|技术|职责|
 |---|---|---|
-|frontend|原生HTML/CSS/JS + Nginx|4业务页+登录，反向代理 /api/|
+|frontend|原生HTML/CSS/JS + Nginx|5业务页+登录，反向代理 /api/|
 |backend|Python3.11/FastAPI/SQLAlchemy/PyJWT|校验、权限、审计、持久化|
 |worker|Python3.11/psycopg|真实双连接锁竞争|
 |db|PostgreSQL16|业务数据、隔离镜像账本|
 |redis|Redis7|持久队列|
 
 目录：`frontend/src/{api,stores,types,components/common,hooks,pages,router,utils,constants}`；`backend/src/{routes,controllers,services,models,schemas,middlewares,utils,constants,config}`；`backend/scripts/seed_demo.py`；`backend/migrations/001_initial.sql`。
-核心实体 Sample、Transfer、Trial 各有模型、schema、服务、路由、API、store与页面；共享 table/badge/frame 组件。共享枚举 roles/run states 位于后端 `src/constants/enums.py`、模型/权限引用和前端 `src/constants/enums.js`、frame/badge；状态枚举 queued/running/completed/failed。两个后端中间件：request_id/errors。
+核心实体 Sample、Transfer、Trial 各有模型、schema、服务、路由、API、store与页面；共享 table/badge/frame 组件。重号清理实体 CleanupJob/CleanupItem/CodeReservation/SampleCodeAlias 集中在 `src/services/cleanup.py`（批次编排）与 `src/services/codes.py`（归一化口径、咨询锁、受理校验），路由 `src/routes/cleanup.py`，前端页面 `pages/cleanup.js`。共享枚举 roles/run states 位于后端 `src/constants/enums.py`、模型/权限引用和前端 `src/constants/enums.js`、frame/badge；状态枚举 queued/running/completed/failed。两个后端中间件：request_id/errors。
 
 环境变量见 `.env.example`：COMPOSE_PROJECT_NAME、三端口、DB_PASSWORD、JWT_SECRET、SEED_DEMO。默认密码仅用于本地演示；JWT8小时有效。seed按自然键仅插入缺失行，不覆盖修改。所有5服务有健康检查，backend/worker依赖健康数据库/Redis，frontend依赖backend；db/redis/artifacts使用命名卷。停止及清空本项目数据：`docker compose down -v --remove-orphans`。
 

@@ -8,4 +8,5 @@ def create(db,data,user):
     sample=db.get(Sample,data.sample_id)
     if not sample: raise HTTPException(404,'样本不存在')
     if data.quantity>sample.quantity: raise HTTPException(422,'移交量超过样本可用量')
+    # 移交按样本主键关联，清理期间冲突号仅暂停“编号受理”，旧移交与新移交均不受影响
     return save(db,Transfer(**data.model_dump()),user,'创建流转申请 '+data.code)
